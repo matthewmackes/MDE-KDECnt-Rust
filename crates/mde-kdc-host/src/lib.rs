@@ -9,13 +9,14 @@
 //! Protocol  ->  Transport (trait)  ->  Host / Router  ->  event stream  ->  Surface
 //! ```
 //!
-//! This first increment lands the non-networking foundation — the [`PeerId`]
-//! newtype, the [`HostError`] type, the [`event`] stream (`HostEvent` +
-//! `EventStream`), and the on-disk [`pairing`] store (`PairingStore`, which also
-//! implements the protocol's [`mde_kdc_proto::crypto::KeyStore`]). The live LAN
-//! transport (UDP 1716 discovery + rustls TCP) and the `Transport` trait it
-//! plugs into are deferred to later increments and are built against these
-//! pieces.
+//! What's landed so far: the non-networking foundation — the [`PeerId`] newtype,
+//! the [`HostError`] type, the [`event`] stream (`HostEvent` + `EventStream`), and
+//! the on-disk [`pairing`] store (`PairingStore`, which also implements the
+//! protocol's [`mde_kdc_proto::crypto::KeyStore`]) — plus the [`transport`]
+//! abstraction itself: the [`Transport`] / [`Connection`] traits and an in-process
+//! [`LoopbackTransport`] that exercises the whole stack on `#[tokio::test]`. Only
+//! the live *LAN* transport (UDP 1716 discovery + rustls TCP) that plugs into
+//! those traits is still deferred to a later increment.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

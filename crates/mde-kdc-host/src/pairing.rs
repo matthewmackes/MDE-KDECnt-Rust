@@ -56,7 +56,11 @@ impl PairingStore {
     /// The conventional store directory, `$XDG_CONFIG_HOME/mde/connect`
     /// (falling back to `$HOME/.config/mde/connect`).
     pub fn default_dir() -> Result<PathBuf, HostError> {
+        // Per the XDG spec, an empty $XDG_CONFIG_HOME is treated as unset, so
+        // filter the empty string out before it shadows the $HOME fallback (else
+        // a set-but-empty var yields a relative `mde/connect` under the CWD).
         let base = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
             .ok_or(HostError::NoConfigDir)?;
@@ -68,8 +72,13 @@ impl PairingStore {
     /// [`PairingKeyPair::from_pkcs8`]; reads `devices.toml`, tolerating a
     /// missing or garbage file by starting empty.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, HostError> {
+        use std::os::unix::fs::PermissionsExt;
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
+        // The store dir holds the long-lived identity key; keep it owner-only.
+        // Harmless to re-apply on every open (the key file is created 0600
+        // regardless, so this is defense-in-depth on the containing dir).
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
 
         let key_path = dir.join("identity.pkcs8");
         let pkcs8 = if key_path.exists() {
@@ -199,11 +208,21 @@ fn public_key_pkcs1_from_pkcs8(pkcs8: &[u8]) -> Result<Vec<u8>, HostError> {
     Ok(der.as_bytes().to_vec())
 }
 
-/// Write a private-key file at mode 0600.
+/// Create a private-key file at mode 0600, applied atomically *at creation* so
+/// the key bytes are never momentarily group/world-readable (the mode-after-write
+/// idiom leaves a 0644 window under the usual umask). `create_new` (O_CREAT |
+/// O_EXCL) additionally refuses to follow a pre-planted symlink, so the key can't
+/// be redirected outside the store dir — `open()` has already confirmed the path
+/// does not exist, so the exclusivity is free.
 fn write_private(path: &Path, der: &[u8]) -> Result<(), HostError> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, der)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(der)?;
     Ok(())
 }
 
@@ -244,6 +263,28 @@ mod tests {
         // Reopen loads the SAME persisted key (no regeneration).
         let s2 = PairingStore::open(tmp.path()).unwrap();
         assert_eq!(s2.public_key_der(), pub1);
+    }
+
+    #[test]
+    fn identity_key_and_dir_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("connect");
+        PairingStore::open(&dir).unwrap();
+        // The private identity key must be 0600 — and created that way, not
+        // chmod'd after a 0644 write (no group/world-readable window).
+        let key_mode = std::fs::metadata(dir.join("identity.pkcs8"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            key_mode, 0o600,
+            "identity.pkcs8 must be 0600, got {key_mode:o}"
+        );
+        // The store dir holding it is owner-only too.
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "store dir must be 0700, got {dir_mode:o}");
     }
 
     #[test]

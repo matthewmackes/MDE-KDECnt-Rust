@@ -47,8 +47,11 @@ impl EventStream {
         (tx, EventStream(rx))
     }
 
-    /// Await the next host event. Returns `None` once every transport has
-    /// dropped its sink.
+    /// Await the next host event. Returns `None` only once *every* sink clone is
+    /// dropped — the transport's own [`EventSink`] and every per-connection clone
+    /// it handed out — since [`EventSink`] is a cloneable mpsc sender. A
+    /// transport's `shutdown` alone won't close the stream while a `Connection`
+    /// still holds a clone.
     pub async fn recv(&mut self) -> Option<HostEvent> {
         self.0.recv().await
     }
