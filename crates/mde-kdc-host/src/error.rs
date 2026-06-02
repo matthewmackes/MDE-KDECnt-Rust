@@ -20,6 +20,19 @@ pub enum HostError {
     #[error("crypto: {0}")]
     Crypto(#[from] mde_kdc_proto::crypto::CryptoError),
 
+    /// JSON (de)serialization of a packet or frame failed.
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// Decoding an inbound wire frame failed.
+    #[error("codec: {0}")]
+    Codec(#[from] mde_kdc_proto::codec::DecodeError),
+
+    /// A transport-level condition (e.g. used before `start`, or a peer that
+    /// isn't reachable).
+    #[error("transport: {0}")]
+    Transport(String),
+
     /// RSA key generation or PKCS#8 / PKCS#1 encoding failed. The host owns
     /// keygen because the protocol crate intentionally ships none (ring 0.17 has
     /// no RSA keygen).

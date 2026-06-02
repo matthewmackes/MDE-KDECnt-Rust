@@ -23,10 +23,12 @@
 pub mod error;
 pub mod event;
 pub mod pairing;
+pub mod transport;
 
 pub use error::HostError;
 pub use event::{EventSink, EventStream, HostEvent};
 pub use pairing::{DeviceRecord, PairingStore};
+pub use transport::{Connection, LoopbackTransport, Transport};
 
 /// The stable identity of a peer — the protocol's `Announce.device_id`.
 ///

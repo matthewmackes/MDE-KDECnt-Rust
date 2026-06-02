@@ -18,6 +18,8 @@ serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
 toml          = "0.8"
 thiserror     = "1"
+# Object-safe async traits (Transport / Connection) on stable rust 1.85.
+async-trait   = "0.1"
 # The event stream is an mpsc channel; the Surface (iced) already runs tokio.
 tokio         = { version = "1", features = ["sync"] }
 # The protocol crate intentionally ships NO RSA keygen (ring 0.17 lacks it), so
