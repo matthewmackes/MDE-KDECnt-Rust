@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members  = ["crates/mde-kdc-proto"]
+members  = ["crates/mde-kdc-proto", "crates/mde-kdc-host"]
 
 [workspace.package]
 edition      = "2021"
