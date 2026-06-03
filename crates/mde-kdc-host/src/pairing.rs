@@ -116,6 +116,16 @@ impl PairingStore {
         self.public_key_der.clone()
     }
 
+    /// This host's identity private key as PKCS#8 DER. The LAN transport needs it
+    /// to build its inbound TLS `ServerConfig` (it must present a cert + key) and
+    /// to issue its self-signed identity cert. In-process only — same trust domain
+    /// as the on-disk `identity.pkcs8` (0600) this returns a copy of; never sent on
+    /// the wire or logged.
+    #[must_use]
+    pub fn identity_pkcs8(&self) -> &[u8] {
+        self.keypair.pkcs8_bytes()
+    }
+
     /// Sign a handshake challenge with this host's identity key
     /// (RSA-PKCS1-v1_5 / SHA-256).
     pub fn sign_challenge(&self, message: &[u8]) -> Result<Vec<u8>, HostError> {

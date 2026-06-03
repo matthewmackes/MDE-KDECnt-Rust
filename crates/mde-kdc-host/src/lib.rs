@@ -39,7 +39,7 @@ pub use discovery::UdpDiscovery;
 pub use error::HostError;
 pub use event::{EventSink, EventStream, HostEvent};
 pub use keygen::{generate_pkcs8, issue_identity_cert, KeygenError};
-pub use lan::LanConnection;
+pub use lan::{host_identity, LanConnection, LanTransport, KDC_TLS_PORT};
 pub use pairing::{DeviceRecord, PairingStore};
 pub use tls::{
     build_client_config, build_server_config, compute_fingerprint, connect_pinned_tls,
