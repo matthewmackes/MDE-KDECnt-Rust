@@ -21,9 +21,11 @@ thiserror     = "1"
 # Object-safe async traits (Transport / Connection) on stable rust 1.85.
 async-trait   = "0.1"
 # The event stream is an mpsc channel; the LAN discovery loop adds a UDP socket
-# (`net`), re-announce/prune timers (`time`), and `select!` (`macros`). The
-# Surface (iced) already runs tokio, so the host never owns the runtime.
-tokio         = { version = "1", features = ["sync", "net", "time", "macros"] }
+# (`net`), re-announce/prune timers (`time`), and `select!` (`macros`). The TLS
+# transport (3b.2) adds `io-util` (split + AsyncRead/WriteExt for framed I/O over
+# the TLS stream) and `rt` (`tokio::spawn` for the per-connection read loops — the
+# ambient Surface runtime drives them; the host still never owns the runtime).
+tokio         = { version = "1", features = ["sync", "net", "time", "macros", "io-util", "rt"] }
 # The protocol crate intentionally ships NO RSA keygen (ring 0.17 lacks it), so
 # the host owns key generation with the pure-Rust `rsa` crate and feeds the
 # PKCS#8 bytes back into mde_kdc_proto::crypto::PairingKeyPair::from_pkcs8.

@@ -185,6 +185,29 @@ pub fn build_client_config(pinned_fingerprint: Option<String>) -> rustls::Client
         .with_no_client_auth()
 }
 
+/// Build a rustls `ServerConfig` presenting our own identity cert + key, for the
+/// inbound side of the LAN transport (a peer connecting to us). KDE Connect's TLS
+/// is mutual self-signed, but client-cert verification is done out-of-band by
+/// fingerprint at the pairing layer, so the server side uses `no_client_auth` here
+/// and the recipient pins the *client's* presented cert separately. `cert_der` is
+/// our self-signed identity cert ([`crate::keygen::issue_identity_cert`]) and
+/// `pkcs8_der` its matching PKCS#8 private key.
+///
+/// Returns `None` if rustls rejects the cert/key pair (mismatched or malformed).
+#[must_use]
+pub fn build_server_config(cert_der: &[u8], pkcs8_der: &[u8]) -> Option<rustls::ServerConfig> {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    let cert_chain = vec![CertificateDer::from(cert_der.to_vec())];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8_der.to_vec()));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("rustls default protocol versions installed")
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)
+        .ok()
+}
+
 /// Errors from the live TLS connect path.
 #[derive(Debug)]
 pub enum ConnectError {
@@ -313,6 +336,23 @@ mod tests {
     fn build_client_config_constructs_both_paths() {
         let _pinned = build_client_config(Some("AA:BB:CC".to_string()));
         let _first = build_client_config(None);
+    }
+
+    #[test]
+    fn build_server_config_accepts_a_real_identity_cert() {
+        // A freshly-issued identity cert + its PKCS#8 key build a ServerConfig.
+        let pkcs8 = crate::keygen::generate_pkcs8().unwrap();
+        let cert = crate::keygen::issue_identity_cert(&pkcs8, "device-A").unwrap();
+        assert!(build_server_config(&cert, &pkcs8).is_some());
+    }
+
+    #[test]
+    fn build_server_config_rejects_a_mismatched_key() {
+        // A cert from one keypair + a different key must not build a server config.
+        let pkcs8_a = crate::keygen::generate_pkcs8().unwrap();
+        let cert_a = crate::keygen::issue_identity_cert(&pkcs8_a, "device-A").unwrap();
+        let pkcs8_b = crate::keygen::generate_pkcs8().unwrap();
+        assert!(build_server_config(&cert_a, &pkcs8_b).is_none());
     }
 
     #[test]

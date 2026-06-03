@@ -30,6 +30,7 @@ pub mod discovery;
 pub mod error;
 pub mod event;
 pub mod keygen;
+pub mod lan;
 pub mod pairing;
 pub mod tls;
 pub mod transport;
@@ -38,10 +39,11 @@ pub use discovery::UdpDiscovery;
 pub use error::HostError;
 pub use event::{EventSink, EventStream, HostEvent};
 pub use keygen::{generate_pkcs8, issue_identity_cert, KeygenError};
+pub use lan::LanConnection;
 pub use pairing::{DeviceRecord, PairingStore};
 pub use tls::{
-    build_client_config, compute_fingerprint, connect_pinned_tls, ConnectError, FirstPairVerifier,
-    PinnedFingerprintVerifier,
+    build_client_config, build_server_config, compute_fingerprint, connect_pinned_tls,
+    ConnectError, FirstPairVerifier, PinnedFingerprintVerifier,
 };
 pub use transport::{Connection, LoopbackTransport, Transport};
 
