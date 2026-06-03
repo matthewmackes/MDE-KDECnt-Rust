@@ -12,13 +12,16 @@
 //! `tokio_rustls::server::TlsStream` (different concrete types) reuse it; each call
 //! site monomorphizes and coerces to `Box<dyn Connection>`.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, WriteHalf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 
 use mde_kdc_proto::discovery::{Announce, DiscoveryRegistry};
 use mde_kdc_proto::{codec, codec::FrameDecoder, wire::Packet};
@@ -57,8 +60,16 @@ where
     /// read loop (emitting `Packet` events onto `sink`), and keeps the write half
     /// for [`Connection::send`].
     pub fn new(stream: S, peer: PeerId, sink: EventSink) -> Self {
+        Self::new_seeded(stream, FrameDecoder::new(), peer, sink)
+    }
+
+    /// Like [`new`](Self::new), but continue an in-progress decode with a pre-seeded
+    /// `decoder`. The inbound listener reads the identity frame first; any bytes it
+    /// over-reads past that frame's newline live in the decoder's buffer and must carry
+    /// into this read loop rather than being dropped on the floor.
+    pub fn new_seeded(stream: S, decoder: FrameDecoder, peer: PeerId, sink: EventSink) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
-        tokio::spawn(read_loop(read_half, peer.clone(), sink.clone()));
+        tokio::spawn(read_loop(read_half, decoder, peer.clone(), sink.clone()));
         Self {
             peer,
             sink,
@@ -67,22 +78,18 @@ where
     }
 }
 
-/// Drain inbound frames off `read_half` and emit each decoded packet onto `sink`.
-/// Stops on EOF (peer closed), a read error, or a malformed frame (which can't be
-/// resynced), emitting `Disconnected` as it exits.
-async fn read_loop<R>(mut read_half: R, peer: PeerId, sink: EventSink)
+/// Drain inbound frames off `read_half` and emit each decoded packet onto `sink`,
+/// starting from any frames already buffered in the seeded `decoder` (the inbound path's
+/// identity-frame residual). Stops on EOF (peer closed), a read error, or a malformed
+/// frame (which can't be resynced), emitting `Disconnected` as it exits.
+async fn read_loop<R>(mut read_half: R, mut decoder: FrameDecoder, peer: PeerId, sink: EventSink)
 where
     R: AsyncRead + Unpin,
 {
-    let mut decoder = FrameDecoder::new();
     let mut buf = [0u8; READ_CHUNK_BYTES];
     loop {
-        let n = match read_half.read(&mut buf).await {
-            Ok(0) => break,  // clean EOF
-            Ok(n) => n,      //
-            Err(_) => break, // socket/TLS read error
-        };
-        decoder.feed(&buf[..n]);
+        // Drain every complete frame already buffered — the seeded residual on the first
+        // pass, then whatever the previous read landed — before blocking on the next read.
         loop {
             match decoder.next_frame() {
                 Ok(Some(packet)) => {
@@ -101,8 +108,55 @@ where
                 }
             }
         }
+        let n = match read_half.read(&mut buf).await {
+            Ok(0) => break,  // clean EOF
+            Ok(n) => n,      //
+            Err(_) => break, // socket/TLS read error
+        };
+        decoder.feed(&buf[..n]);
     }
     let _ = sink.send(HostEvent::Disconnected(peer.clone()));
+}
+
+/// Read frames off `stream` until the first complete one. Returns the decoded packet plus
+/// the [`FrameDecoder`] — which may hold bytes read *past* that frame's newline; the caller
+/// must hand the decoder to the connection's read loop ([`LanConnection::new_seeded`]) so
+/// those bytes aren't lost. Used by the inbound listener's identity-first handshake.
+async fn read_first_frame<S>(stream: &mut S) -> Result<(Packet, FrameDecoder), HostError>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut decoder = FrameDecoder::new();
+    let mut buf = [0u8; READ_CHUNK_BYTES];
+    loop {
+        match decoder.next_frame() {
+            Ok(Some(packet)) => return Ok((packet, decoder)),
+            Ok(None) => {}
+            Err(e) => return Err(HostError::Transport(format!("decode: {e}"))),
+        }
+        let n = stream
+            .read(&mut buf)
+            .await
+            .map_err(|e| HostError::Transport(format!("read: {e}")))?;
+        if n == 0 {
+            return Err(HostError::Transport("identity_eof".into()));
+        }
+        decoder.feed(&buf[..n]);
+    }
+}
+
+/// Extract the [`Announce`] from a peer's first inbound frame, which must be a
+/// `kdeconnect.identity` packet (mirrors [`mde_kdc_proto::discovery::decode_announce_datagram`]
+/// but over the TCP framing). Any other packet kind is rejected.
+fn announce_from_identity(packet: Packet) -> Result<Announce, HostError> {
+    if packet.kind != "kdeconnect.identity" {
+        return Err(HostError::Transport(format!(
+            "expected_identity_got_{}",
+            packet.kind
+        )));
+    }
+    serde_json::from_value(packet.body)
+        .map_err(|e| HostError::Transport(format!("identity_body: {e}")))
 }
 
 #[async_trait]
@@ -163,6 +217,19 @@ pub struct LanTransport {
     /// Fires on `shutdown` to stop the discovery loop; the join handle is awaited.
     shutdown_tx: AsyncMutex<Option<oneshot::Sender<()>>>,
     disc_task: AsyncMutex<Option<JoinHandle<()>>>,
+    /// If set, `start` binds a TCP listener here and accepts inbound peer-initiated links
+    /// (mutual TLS + identity-first handshake). `None` = outbound-only (no listener).
+    /// Production binds `0.0.0.0:`[`KDC_TLS_PORT`]; tests use `127.0.0.1:0`.
+    listen_addr: Option<SocketAddr>,
+    /// The actually-bound listener address (ephemeral port resolved), set by `start`.
+    bound_addr: AsyncMutex<Option<SocketAddr>>,
+    /// Accepted inbound connections keyed by peer id, kept alive so their write half
+    /// survives for [`send_to`](Self::send_to) and their read loop keeps surfacing
+    /// packets. One link per peer — a reconnect replaces (and drops) the prior.
+    inbound: Arc<AsyncMutex<HashMap<String, Box<dyn Connection>>>>,
+    /// Fires on `shutdown` to stop the accept loop; its join handle is awaited.
+    listen_shutdown: AsyncMutex<Option<oneshot::Sender<()>>>,
+    listen_task: AsyncMutex<Option<JoinHandle<()>>>,
 }
 
 impl LanTransport {
@@ -181,6 +248,11 @@ impl LanTransport {
             sink: AsyncMutex::new(None),
             shutdown_tx: AsyncMutex::new(None),
             disc_task: AsyncMutex::new(None),
+            listen_addr: None,
+            bound_addr: AsyncMutex::new(None),
+            inbound: Arc::new(AsyncMutex::new(HashMap::new())),
+            listen_shutdown: AsyncMutex::new(None),
+            listen_task: AsyncMutex::new(None),
         }
     }
 
@@ -189,6 +261,71 @@ impl LanTransport {
     pub fn with_dial_port(mut self, port: u16) -> Self {
         self.dial_port = port;
         self
+    }
+
+    /// Enable the **inbound listener**: `start` binds `addr` and accepts peer-initiated
+    /// links. Production binds `0.0.0.0:`[`KDC_TLS_PORT`]; tests pass `127.0.0.1:0` and
+    /// read the resolved port back via [`local_listen_addr`](Self::local_listen_addr).
+    /// Without this, the transport is outbound-only.
+    #[must_use]
+    pub fn with_listen_addr(mut self, addr: SocketAddr) -> Self {
+        self.listen_addr = Some(addr);
+        self
+    }
+
+    /// The address the inbound listener actually bound (with the ephemeral port resolved),
+    /// or `None` if listening is disabled or `start` hasn't run / has shut down.
+    pub async fn local_listen_addr(&self) -> Option<SocketAddr> {
+        *self.bound_addr.lock().await
+    }
+
+    /// Send `packet` to a peer over its **inbound** (peer-initiated) connection. Errors
+    /// with `no_inbound_connection` if the peer only ever connected outbound (whose
+    /// `Connection` the caller holds directly from `open`) or isn't connected at all.
+    pub async fn send_to(&self, peer: &PeerId, packet: Packet) -> Result<(), HostError> {
+        let map = self.inbound.lock().await;
+        match map.get(peer.as_str()) {
+            Some(conn) => conn.send(packet).await,
+            None => Err(HostError::Transport("no_inbound_connection".into())),
+        }
+    }
+
+    /// The peers with a live inbound connection (observability + tests).
+    pub async fn inbound_peers(&self) -> Vec<PeerId> {
+        self.inbound
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .map(PeerId::from)
+            .collect()
+    }
+
+    /// Build our server identity + the mutual-TLS server config, bind the listener, and
+    /// spawn its accept loop. Called by `start` when a listen addr is configured; a bind
+    /// failure is surfaced (not fatal — outbound still works).
+    async fn spawn_listener(&self, addr: SocketAddr, events: EventSink) -> Result<(), HostError> {
+        let (cert, pkcs8) = host_identity(&self.pairing, &self.announce.device_id)?;
+        let server_cfg = tls::build_server_config_with_client_auth(&cert, &pkcs8)
+            .ok_or_else(|| HostError::Transport("server_config".into()))?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| HostError::Transport(format!("bind: {e}")))?;
+        let bound = listener
+            .local_addr()
+            .map_err(|e| HostError::Transport(format!("local_addr: {e}")))?;
+        *self.bound_addr.lock().await = Some(bound);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        *self.listen_shutdown.lock().await = Some(stop_tx);
+        *self.listen_task.lock().await = Some(tokio::spawn(run_listener(
+            listener,
+            Arc::new(server_cfg),
+            Arc::clone(&self.pairing),
+            Arc::clone(&self.inbound),
+            events,
+            stop_rx,
+        )));
+        Ok(())
     }
 
     /// The shared discovery registry handle (so a caller can inject peers in tests
@@ -211,7 +348,15 @@ impl Transport for LanTransport {
         *self.sink.lock().await = Some(events.clone());
         let (stop_tx, stop_rx) = oneshot::channel();
         *self.shutdown_tx.lock().await = Some(stop_tx);
-        *self.disc_task.lock().await = Some(tokio::spawn(discovery.run(events, stop_rx)));
+        *self.disc_task.lock().await = Some(tokio::spawn(discovery.run(events.clone(), stop_rx)));
+        // Inbound listener (best-effort): bind the configured port and accept
+        // peer-initiated links. A bind failure is surfaced as a TransportError but does
+        // NOT fail `start` — the outbound (`open`) path stays usable regardless.
+        if let Some(addr) = self.listen_addr {
+            if let Err(e) = self.spawn_listener(addr, events.clone()).await {
+                let _ = events.send(HostEvent::TransportError(format!("listen: {e}")));
+            }
+        }
         Ok(())
     }
 
@@ -258,6 +403,17 @@ impl Transport for LanTransport {
         if let Some(task) = self.disc_task.lock().await.take() {
             let _ = task.await;
         }
+        // Stop the inbound accept loop and tear down accepted connections.
+        if let Some(tx) = self.listen_shutdown.lock().await.take() {
+            let _ = tx.send(());
+        }
+        if let Some(task) = self.listen_task.lock().await.take() {
+            let _ = task.await;
+        }
+        for (_id, conn) in self.inbound.lock().await.drain() {
+            conn.close().await;
+        }
+        *self.bound_addr.lock().await = None;
         *self.sink.lock().await = None;
     }
 }
@@ -273,6 +429,126 @@ pub fn host_identity(
     let cert = keygen::issue_identity_cert(&pkcs8, device_id)
         .map_err(|e| HostError::Transport(format!("identity cert: {e}")))?;
     Ok((cert, pkcs8))
+}
+
+/// Accept inbound peer links until `stop` fires. Each accepted TCP connection is handed to
+/// [`handle_inbound`] on its own task, so a slow or hostile handshake can't stall the loop
+/// or block other peers. A transient `accept` error is skipped; the loop keeps listening.
+async fn run_listener(
+    listener: TcpListener,
+    server_cfg: Arc<rustls::ServerConfig>,
+    pairing: Arc<PairingStore>,
+    inbound: Arc<AsyncMutex<HashMap<String, Box<dyn Connection>>>>,
+    sink: EventSink,
+    mut stop: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut stop => break,
+            accepted = listener.accept() => {
+                let tcp = match accepted {
+                    Ok((tcp, _addr)) => tcp,
+                    Err(_) => continue, // transient accept error — keep listening
+                };
+                tokio::spawn(handle_inbound(
+                    tcp,
+                    Arc::clone(&server_cfg),
+                    Arc::clone(&pairing),
+                    Arc::clone(&inbound),
+                    sink.clone(),
+                ));
+            }
+        }
+    }
+}
+
+/// Authenticate and register one inbound peer link:
+///
+/// 1. Complete the **mutual-TLS** handshake (the peer presents its identity cert).
+/// 2. Run the **identity-first handshake** — read the peer's first frame, which must be a
+///    `kdeconnect.identity` packet, to learn the *claimed* device id.
+/// 3. **Bind** the claimed id to cryptographic proof: the device must be paired, and the
+///    fingerprint of the cert it presented in step 1 must equal the value pinned at pair
+///    time. This is what stops a peer from spoofing another device's id.
+///
+/// On success it emits `Connected` and stores the framed [`LanConnection`] (so `send_to`
+/// can reply and the read loop surfaces inbound `Packet`s). Every rejection is surfaced as
+/// a `TransportError` carrying a stable token, and the link is dropped.
+async fn handle_inbound(
+    tcp: TcpStream,
+    server_cfg: Arc<rustls::ServerConfig>,
+    pairing: Arc<PairingStore>,
+    inbound: Arc<AsyncMutex<HashMap<String, Box<dyn Connection>>>>,
+    sink: EventSink,
+) {
+    let acceptor = TlsAcceptor::from(server_cfg);
+    let mut tls = match acceptor.accept(tcp).await {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = sink.send(HostEvent::TransportError(format!("inbound_tls: {e}")));
+            return;
+        }
+    };
+    // The peer's presented client cert (mutual TLS) — its fingerprint is the identity proof.
+    let presented_fp = {
+        let (_io, conn) = tls.get_ref();
+        conn.peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|cert| tls::compute_fingerprint(cert.as_ref()))
+    };
+    // Identity-first handshake: learn who's claiming to connect.
+    let (packet, decoder) = match read_first_frame(&mut tls).await {
+        Ok(x) => x,
+        Err(e) => {
+            let _ = sink.send(HostEvent::TransportError(format!("inbound_identity: {e}")));
+            return;
+        }
+    };
+    let announce = match announce_from_identity(packet) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = sink.send(HostEvent::TransportError(format!("inbound_identity: {e}")));
+            return;
+        }
+    };
+    let peer_id = announce.device_id.clone();
+    // Must be a paired device.
+    let pinned = match pairing.get(&peer_id) {
+        Some(rec) => rec.fingerprint.clone(),
+        None => {
+            let _ = sink.send(HostEvent::TransportError(format!(
+                "inbound_not_paired: {peer_id}"
+            )));
+            return;
+        }
+    };
+    // Bind the claimed identity to the presented cert. An empty pin means the device was
+    // recorded without a fingerprint (first-pair not yet completed) — the live listener
+    // refuses it; the pairing flow, not this listener, owns first-pair.
+    if pinned.is_empty() {
+        let _ = sink.send(HostEvent::TransportError(format!(
+            "inbound_unpinned: {peer_id}"
+        )));
+        return;
+    }
+    if presented_fp.as_deref() != Some(pinned.as_str()) {
+        let _ = sink.send(HostEvent::TransportError(format!(
+            "kdc-fingerprint-mismatch: {peer_id}"
+        )));
+        return;
+    }
+    // Authenticated. Wrap the remaining stream (the seeded decoder carries any bytes read
+    // past the identity frame), register the link, then announce it. Registering before
+    // `Connected` means a consumer can `send_to` the moment it sees the event.
+    let peer = PeerId::from(peer_id.clone());
+    let conn: Box<dyn Connection> = Box::new(LanConnection::new_seeded(
+        tls,
+        decoder,
+        peer.clone(),
+        sink.clone(),
+    ));
+    inbound.lock().await.insert(peer_id, conn);
+    let _ = sink.send(HostEvent::Connected(peer));
 }
 
 #[cfg(test)]
@@ -456,6 +732,182 @@ mod tests {
         // Unknown peer → not_paired.
         let r = transport.open(&PeerId::from("nobody")).await;
         assert!(matches!(r, Err(HostError::Transport(ref m)) if m.contains("not_paired")));
+        transport.shutdown().await;
+    }
+
+    // ── Inbound listener (host increment 3b.2e) ──────────────────────────────
+
+    /// A `kdeconnect.identity` packet carrying `a` — the first frame a peer sends after
+    /// the inbound TLS handshake (same envelope as the UDP identity broadcast).
+    fn identity_packet(a: &Announce) -> Packet {
+        Packet {
+            id: 1,
+            kind: "kdeconnect.identity".to_string(),
+            body: serde_json::to_value(a).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    /// Build a listening host transport over a fresh pairing store (mutated by `setup` to
+    /// add paired devices), start it, and return it plus its bound listener addr + stream.
+    async fn start_listening_host(
+        setup: impl FnOnce(&mut PairingStore),
+    ) -> (LanTransport, SocketAddr, EventStream) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = PairingStore::open(tmp.path()).unwrap();
+        setup(&mut store);
+        let pairing = Arc::new(store);
+        let discovery = UdpDiscovery::bind("127.0.0.1:0".parse().unwrap(), announce("self"))
+            .await
+            .unwrap();
+        let transport = LanTransport::new(announce("self"), discovery, pairing)
+            .with_listen_addr("127.0.0.1:0".parse().unwrap());
+        let (sink, stream) = EventStream::channel();
+        transport.start(sink).await.unwrap();
+        let addr = transport
+            .local_listen_addr()
+            .await
+            .expect("listener bound after start");
+        (transport, addr, stream)
+    }
+
+    /// A peer that connects to `addr` presenting `cert`/`pkcs8` (mutual TLS, accepting any
+    /// server cert), then sends its `kdeconnect.identity` frame for `device_id`. Returns
+    /// the framed connection (kept alive by the caller) + its stream (server→peer packets).
+    #[allow(clippy::type_complexity)]
+    async fn connect_as(
+        addr: SocketAddr,
+        device_id: &str,
+        cert: &[u8],
+        pkcs8: &[u8],
+    ) -> (
+        LanConnection<tokio_rustls::client::TlsStream<TcpStream>>,
+        EventStream,
+    ) {
+        let tls = crate::tls::connect_tls_with_identity(addr, "self", None, cert, pkcs8)
+            .await
+            .expect("client mutual-tls connect");
+        let (sink, stream) = EventStream::channel();
+        let conn = LanConnection::new(tls, PeerId::from("self"), sink);
+        conn.send(identity_packet(&announce(device_id)))
+            .await
+            .expect("send identity frame");
+        (conn, stream)
+    }
+
+    #[tokio::test]
+    async fn inbound_listener_accepts_paired_peer_and_round_trips() {
+        // A paired phone (pinned to its cert fingerprint) initiates a link: the listener
+        // completes mutual TLS, reads the identity frame, binds the presented fingerprint
+        // to the pinned value, and surfaces Connected + the phone's packets. send_to replies.
+        let phone_pkcs8 = crate::keygen::generate_pkcs8().unwrap();
+        let phone_cert = crate::keygen::issue_identity_cert(&phone_pkcs8, "phone-1").unwrap();
+        let phone_fp = compute_fingerprint(&phone_cert);
+
+        let (transport, addr, mut host_stream) = start_listening_host(|store| {
+            store
+                .pair(DeviceRecord {
+                    device_id: "phone-1".into(),
+                    device_name: "Phone".into(),
+                    paired_at_ms: 1,
+                    fingerprint: phone_fp.clone(),
+                })
+                .unwrap();
+        })
+        .await;
+
+        let (client, mut client_stream) =
+            connect_as(addr, "phone-1", &phone_cert, &phone_pkcs8).await;
+
+        // The host announces the authenticated inbound link.
+        let connected = tokio::time::timeout(std::time::Duration::from_secs(2), host_stream.recv())
+            .await
+            .expect("connected before timeout");
+        assert!(matches!(connected, Some(HostEvent::Connected(p)) if p.as_str() == "phone-1"));
+
+        // A ping from the phone surfaces as a Packet attributed to phone-1.
+        client
+            .send(plugins::ping_packet(7, "hi".into()))
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), host_stream.recv())
+            .await
+            .expect("packet before timeout");
+        assert!(
+            matches!(got, Some(HostEvent::Packet { peer, packet }) if peer.as_str() == "phone-1" && packet.id == 7)
+        );
+
+        // Bidirectional: send_to reaches the phone's own stream.
+        transport
+            .send_to(
+                &PeerId::from("phone-1"),
+                plugins::ping_packet(8, "yo".into()),
+            )
+            .await
+            .expect("send_to the inbound peer");
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), client_stream.recv())
+            .await
+            .expect("reply before timeout");
+        assert!(matches!(reply, Some(HostEvent::Packet { packet, .. }) if packet.id == 8));
+
+        assert_eq!(
+            transport.inbound_peers().await,
+            vec![PeerId::from("phone-1")]
+        );
+        transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_listener_rejects_unpaired_peer() {
+        // An unpaired device id is refused after the identity handshake; nothing registers.
+        let pkcs8 = crate::keygen::generate_pkcs8().unwrap();
+        let cert = crate::keygen::issue_identity_cert(&pkcs8, "stranger").unwrap();
+
+        let (transport, addr, mut host_stream) = start_listening_host(|_store| {}).await;
+        let (_client, _cs) = connect_as(addr, "stranger", &cert, &pkcs8).await;
+
+        let evt = tokio::time::timeout(std::time::Duration::from_secs(2), host_stream.recv())
+            .await
+            .expect("an event before timeout");
+        assert!(
+            matches!(evt, Some(HostEvent::TransportError(m)) if m.contains("inbound_not_paired"))
+        );
+        assert!(transport.inbound_peers().await.is_empty());
+        transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_listener_rejects_fingerprint_mismatch() {
+        // phone-1 is paired, but pinned to a DIFFERENT cert than the one the connecting
+        // client presents → a spoofed identity. The fingerprint binding rejects it.
+        let real_pkcs8 = crate::keygen::generate_pkcs8().unwrap();
+        let real_cert = crate::keygen::issue_identity_cert(&real_pkcs8, "phone-1").unwrap();
+        let pinned_fp = compute_fingerprint(&real_cert);
+
+        let imposter_pkcs8 = crate::keygen::generate_pkcs8().unwrap();
+        let imposter_cert = crate::keygen::issue_identity_cert(&imposter_pkcs8, "phone-1").unwrap();
+
+        let (transport, addr, mut host_stream) = start_listening_host(|store| {
+            store
+                .pair(DeviceRecord {
+                    device_id: "phone-1".into(),
+                    device_name: "Phone".into(),
+                    paired_at_ms: 1,
+                    fingerprint: pinned_fp.clone(),
+                })
+                .unwrap();
+        })
+        .await;
+
+        let (_client, _cs) = connect_as(addr, "phone-1", &imposter_cert, &imposter_pkcs8).await;
+
+        let evt = tokio::time::timeout(std::time::Duration::from_secs(2), host_stream.recv())
+            .await
+            .expect("an event before timeout");
+        assert!(
+            matches!(evt, Some(HostEvent::TransportError(m)) if m.contains("kdc-fingerprint-mismatch"))
+        );
+        assert!(transport.inbound_peers().await.is_empty());
         transport.shutdown().await;
     }
 }

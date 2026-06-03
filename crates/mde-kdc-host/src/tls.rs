@@ -22,8 +22,22 @@ use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use sha2::{Digest, Sha256};
+
+/// The self-signed RSA-2048 identity certs only ever sign with these schemes;
+/// every custom verifier advertises exactly this set (mirrors upstream KDC).
+fn rsa_identity_schemes() -> Vec<SignatureScheme> {
+    vec![
+        SignatureScheme::RSA_PKCS1_SHA256,
+        SignatureScheme::RSA_PKCS1_SHA384,
+        SignatureScheme::RSA_PKCS1_SHA512,
+        SignatureScheme::RSA_PSS_SHA256,
+        SignatureScheme::RSA_PSS_SHA384,
+        SignatureScheme::RSA_PSS_SHA512,
+    ]
+}
 
 /// Compute the KDE-Connect-style cert fingerprint: SHA-256 of the DER bytes,
 /// upper-case hex with `:` between every byte. Pure + deterministic. Used both at
@@ -99,16 +113,7 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        // Mirror upstream's allowed schemes — RSA-PKCS1 + RSA-PSS over
-        // SHA-256/384/512 cover the self-signed RSA-2048 identity certs.
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-        ]
+        rsa_identity_schemes()
     }
 }
 
@@ -154,14 +159,64 @@ impl ServerCertVerifier for FirstPairVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-        ]
+        rsa_identity_schemes()
+    }
+}
+
+/// A rustls `ClientCertVerifier` for the **inbound** (listener) side. KDE Connect's
+/// modern protocol is mutual-TLS: a peer connecting to us presents its identity cert.
+/// This verifier *requires* a client cert (so it lands in `peer_certificates()`) but
+/// accepts ANY cert at the TLS layer — the binding to a paired device's pinned
+/// fingerprint is enforced one layer up, in the listener, after the identity-first
+/// handshake reveals *which* device is claiming to connect.
+///
+/// **Audit note (divergence from the reference port):** the `/tmp/MDE-guidance`
+/// reference uses `no_client_auth` on its (test-only) inbound TLS, leaving the
+/// connecting peer's identity unauthenticated at the transport. We instead request the
+/// client cert and bind its fingerprint to the pinned value, so a peer cannot spoof a
+/// paired device id. Flagged for the owner's adversarial audit.
+#[derive(Debug, Default)]
+pub struct AcceptAnyClientCert {
+    /// `root_hint_subjects` must return a slice; we advertise none (self-signed model).
+    no_hints: Vec<DistinguishedName>,
+}
+
+impl ClientCertVerifier for AcceptAnyClientCert {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.no_hints
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        // Accept at the TLS layer; the listener pins the presented fingerprint to the
+        // claimed (paired) device id after the identity handshake.
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rsa_identity_schemes()
     }
 }
 
@@ -208,6 +263,30 @@ pub fn build_server_config(cert_der: &[u8], pkcs8_der: &[u8]) -> Option<rustls::
         .ok()
 }
 
+/// Build a rustls `ServerConfig` for the **inbound listener** that, unlike
+/// [`build_server_config`], *requests and requires* a client cert ([`AcceptAnyClientCert`])
+/// so the peer's presented identity cert is available in `peer_certificates()` after the
+/// handshake. The listener then binds that cert's fingerprint to the paired device's
+/// pinned value (mutual-TLS identity, see [`AcceptAnyClientCert`]'s audit note).
+/// `cert_der` is our self-signed identity cert and `pkcs8_der` its PKCS#8 key. Returns
+/// `None` if rustls rejects the cert/key pair.
+#[must_use]
+pub fn build_server_config_with_client_auth(
+    cert_der: &[u8],
+    pkcs8_der: &[u8],
+) -> Option<rustls::ServerConfig> {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    let cert_chain = vec![CertificateDer::from(cert_der.to_vec())];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8_der.to_vec()));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("rustls default protocol versions installed")
+        .with_client_cert_verifier(Arc::new(AcceptAnyClientCert::default()))
+        .with_single_cert(cert_chain, key)
+        .ok()
+}
+
 /// Errors from the live TLS connect path.
 #[derive(Debug)]
 pub enum ConnectError {
@@ -217,6 +296,8 @@ pub enum ConnectError {
     Tls(std::io::Error),
     /// The peer name couldn't be parsed as a `ServerName`.
     BadPeerName(String),
+    /// Our own client identity cert/key was rejected by rustls (mutual-TLS path).
+    BadIdentity(String),
 }
 
 impl std::fmt::Display for ConnectError {
@@ -225,6 +306,7 @@ impl std::fmt::Display for ConnectError {
             ConnectError::Tcp(e) => write!(f, "tcp: {e}"),
             ConnectError::Tls(e) => write!(f, "tls: {e}"),
             ConnectError::BadPeerName(s) => write!(f, "bad_peer_name: {s}"),
+            ConnectError::BadIdentity(s) => write!(f, "bad_identity: {s}"),
         }
     }
 }
@@ -235,6 +317,12 @@ impl std::error::Error for ConnectError {}
 /// ClientHello, with the cert pinned to `pinned_fingerprint` (`None` = first-pair /
 /// accept any). Returns a `tokio_rustls::client::TlsStream<TcpStream>` the router
 /// wraps with the codec framer + payload-channel handshake.
+///
+/// Outbound is currently server-auth only (`with_no_client_auth`). **FOLLOW-UP (planned,
+/// per the Mackes Workstation plan §0):** switch this to mutual TLS via
+/// [`connect_tls_with_identity`] so a peer whose listener requires a client cert (modern
+/// KDE Connect, and our own [`build_server_config_with_client_auth`] inbound side) accepts
+/// us — making both directions symmetric.
 pub async fn connect_pinned_tls(
     addr: std::net::SocketAddr,
     server_name: &str,
@@ -247,6 +335,63 @@ pub async fn connect_pinned_tls(
         .map_err(ConnectError::Tcp)?;
     let config = Arc::new(build_client_config(pinned_fingerprint));
     let connector = tokio_rustls::TlsConnector::from(config);
+    connector
+        .connect(server_name_owned, tcp)
+        .await
+        .map_err(ConnectError::Tls)
+}
+
+/// Like [`build_client_config`] but the client **presents its own identity cert + key**
+/// (mutual TLS), required to connect to a listener that requests a client cert (our
+/// [`build_server_config_with_client_auth`], and modern KDE Connect devices).
+/// `pinned_fingerprint`: `None` = first-pair / accept any server cert, `Some` = pin the
+/// server's cert. Returns `None` if rustls rejects our cert/key pair.
+#[must_use]
+pub fn build_client_config_with_identity(
+    pinned_fingerprint: Option<String>,
+    client_cert_der: &[u8],
+    client_pkcs8_der: &[u8],
+) -> Option<rustls::ClientConfig> {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("rustls default protocol versions installed");
+    let verifier: Arc<dyn ServerCertVerifier> = if let Some(pin) = pinned_fingerprint {
+        Arc::new(PinnedFingerprintVerifier::new(pin))
+    } else {
+        Arc::new(FirstPairVerifier)
+    };
+    let cert_chain = vec![CertificateDer::from(client_cert_der.to_vec())];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_pkcs8_der.to_vec()));
+    builder
+        .dangerous() // self-signed model — pinning replaces chain validation
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(cert_chain, key)
+        .ok()
+}
+
+/// Open a **mutual-TLS** connection to `addr` presenting our identity cert (so a peer
+/// whose listener requests a client cert accepts us), pinning the server's cert to
+/// `pinned_fingerprint` (`None` = first-pair). Mirrors [`connect_pinned_tls`] but with
+/// client auth — used to drive the inbound listener and available for the mutual
+/// outbound path.
+pub async fn connect_tls_with_identity(
+    addr: std::net::SocketAddr,
+    server_name: &str,
+    pinned_fingerprint: Option<String>,
+    client_cert_der: &[u8],
+    client_pkcs8_der: &[u8],
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, ConnectError> {
+    let server_name_owned = ServerName::try_from(server_name.to_string())
+        .map_err(|e| ConnectError::BadPeerName(format!("{e}")))?;
+    let config =
+        build_client_config_with_identity(pinned_fingerprint, client_cert_der, client_pkcs8_der)
+            .ok_or_else(|| ConnectError::BadIdentity("client cert/key rejected".into()))?;
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(ConnectError::Tcp)?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     connector
         .connect(server_name_owned, tcp)
         .await
@@ -356,6 +501,31 @@ mod tests {
     }
 
     #[test]
+    fn build_server_config_with_client_auth_accepts_a_real_identity_cert() {
+        // The mutual-TLS listener config builds from a real identity cert + key.
+        let pkcs8 = crate::keygen::generate_pkcs8().unwrap();
+        let cert = crate::keygen::issue_identity_cert(&pkcs8, "device-A").unwrap();
+        assert!(build_server_config_with_client_auth(&cert, &pkcs8).is_some());
+    }
+
+    #[test]
+    fn build_client_config_with_identity_constructs_both_paths() {
+        let pkcs8 = crate::keygen::generate_pkcs8().unwrap();
+        let cert = crate::keygen::issue_identity_cert(&pkcs8, "client-A").unwrap();
+        assert!(build_client_config_with_identity(Some("AA:BB".into()), &cert, &pkcs8).is_some());
+        assert!(build_client_config_with_identity(None, &cert, &pkcs8).is_some());
+    }
+
+    #[test]
+    fn build_client_config_with_identity_rejects_mismatched_key() {
+        // A client cert from one keypair + a different key must not build a config.
+        let pkcs8_a = crate::keygen::generate_pkcs8().unwrap();
+        let cert_a = crate::keygen::issue_identity_cert(&pkcs8_a, "client-A").unwrap();
+        let pkcs8_b = crate::keygen::generate_pkcs8().unwrap();
+        assert!(build_client_config_with_identity(None, &cert_a, &pkcs8_b).is_none());
+    }
+
+    #[test]
     fn fingerprint_against_real_identity_cert_round_trips() {
         // Integration with keygen: a freshly-issued cert has a stable fingerprint
         // the pinned verifier accepts.
@@ -401,5 +571,6 @@ mod tests {
         )
         .starts_with("tcp: "));
         assert!(format!("{}", ConnectError::BadPeerName("x".into())).starts_with("bad_peer_name: "));
+        assert!(format!("{}", ConnectError::BadIdentity("x".into())).starts_with("bad_identity: "));
     }
 }
