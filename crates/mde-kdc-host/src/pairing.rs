@@ -145,6 +145,13 @@ impl PairingStore {
         self.devices.get(device_id)
     }
 
+    /// Every trusted peer, for enumeration — e.g. a host surfacing the paired-device
+    /// roster (the `mde connect` daemon's `Devices()`). Iteration order is unspecified.
+    #[must_use]
+    pub fn records(&self) -> Vec<&DeviceRecord> {
+        self.devices.values().collect()
+    }
+
     /// Number of trusted peers.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -358,6 +365,18 @@ mod tests {
             s.unpair("dev-1").unwrap();
         }
         assert!(!PairingStore::open(tmp.path()).unwrap().is_paired("dev-1"));
+    }
+
+    #[test]
+    fn records_enumerates_every_paired_peer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = PairingStore::open(tmp.path()).unwrap();
+        s.pair(rec("dev-1")).unwrap();
+        s.pair(rec("dev-2")).unwrap();
+        let mut ids: Vec<&str> = s.records().iter().map(|d| d.device_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["dev-1", "dev-2"]);
+        assert!(PairingStore::open(tmp.path()).unwrap().records().len() == 2);
     }
 
     #[test]
